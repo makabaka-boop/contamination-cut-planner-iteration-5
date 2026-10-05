@@ -62,8 +62,12 @@ docker compose up --build
 | `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录 |
 | `POST /plans/{plan_id}/adopt` | 采用一次**成功**计算并保存该计算时刻冻结的完整快照；同一计算**至多采用一次**，即使后来被其他计算替换也不可再次采用；并发采用冲突返回 409 |
 | `GET /plans/{plan_id}/adoption` | 查询当前已采用结果（完整快照） |
-| `POST /plans/{plan_id}/reviews` | 对当前已采用结果执行**现场关闭复核**：提交现场确实已关闭的管段 ID 集合，并可选提交必须保持开启的管段 ID 集合；在采用快照冻结方案中，把已关闭边移除、把保持开启边视为不可切断，再在其余边上求追加关闭费用最小的隔断；复核记录冻结输入与结果，不修改方案、计算记录或采用快照 |
-| `GET /plans/{plan_id}/reviews/{review_id}` | 按 ID 查询复核记录（冻结的输入与结果，重启后仍可读取） |
+| `POST /plans/{plan_id}/reviews` | **旧的一次性接口**：对当前已采用结果执行现场关闭复核，冻结一次完整输入与结果，不创建执行进度 |
+| `GET /plans/{plan_id}/reviews/{review_id}` | 按 ID 查询一次性复核或已完成检查点生成的不可变复核记录（冻结的输入与结果，重启后仍可读取） |
+| `POST /plans/{plan_id}/execution-checkpoints` | 从一次当前已采用结果创建逐班执行检查点；永久绑定该采用事件的冻结方案与计算版本；返回修订号 1 的当前进度 |
+| `GET /plans/{plan_id}/execution-checkpoints/{checkpoint_id}` | 按 ID 查询检查点当前累计执行进度（活动或已完成） |
+| `POST /plans/{plan_id}/execution-checkpoints/{checkpoint_id}/append` | 交班追加：携带 `expected_revision` 与本次新增的已关闭/保持开启管段；只能增加管段，成功后修订号 +1，并重算累计最低追加隔断、费用与见证 |
+| `POST /plans/{plan_id}/execution-checkpoints/{checkpoint_id}/complete` | 将当前检查点冻结为不可变复核记录；`review_id` 与 `checkpoint_id` 相同，可通过旧 reviews 读取接口按 ID 获取 |
 
 ### 调用示例
 
@@ -207,15 +211,82 @@ curl -X POST http://localhost:8000/plans/demo/reviews \
 整体回滚（500），不留下半条复核记录，也绝不修改原方案、计算记录或
 采用快照。
 
+### 分班施工的执行检查点
+
+隔断施工分班完成时，交班者不需要重新提交整份清单。先从一次**当前已采用
+结果**创建执行检查点：检查点在同一事务中永久绑定当时的
+`adoption_event`、计算 ID、方案修订号与完整方案/结果快照。此后即使编辑
+方案或采用另一计算，该检查点仍只按创建时的冻结快照推进。
+
+```bash
+curl -X POST http://localhost:8000/plans/demo/execution-checkpoints
+```
+
+```json
+{
+  "checkpoint_id": "e1b6...",
+  "plan_id": "demo",
+  "plan_revision": 1,
+  "computation_id": "6dc73aa10a0d4ee897af3b6abc5d93d7",
+  "revision": 1,
+  "status": "ACTIVE",
+  "created_at": "2026-10-05T08:00:00+00:00",
+  "updated_at": "2026-10-05T08:00:00+00:00",
+  "closed_segments": [],
+  "keep_open_segments": [],
+  "additional_segments": ["p1", "p2"],
+  "additional_cost": 10,
+  "witness": {"source_zones": ["SRC1", "SRC2"], "cut_segments": ["p1", "p2"], "total_cost": 10}
+}
+```
+
+下一班只提交本次新增的现场约束与读到的检查点修订号：
+
+```bash
+curl -X POST \
+  http://localhost:8000/plans/demo/execution-checkpoints/e1b6.../append \
+  -H 'content-type: application/json' \
+  -d '{"expected_revision": 1, "closed_segments": ["p1"]}'
+```
+
+服务在同一事务中锁定该检查点、确认修订号仍为 `1`，把新管段并入累计
+集合，然后按冻结方案重算最低追加隔断、追加费用与完整见证；成功时保存
+新结果并把检查点修订号推进到 `2`。随后可继续携带修订号 `2` 追加：
+
+```json
+{
+  "expected_revision": 2,
+  "keep_open_segments": ["p3"]
+}
+```
+
+累计集合只能增加：本次请求内不能重复或交叉，已关闭管段不能再次提交，
+保持开启管段也不能再次提交，两类管段不能在后续追加中互换。未知管段、
+重复/交叉、保持开启导致不可执行、检查点修订号过期或写入失败都会回滚，
+当前检查点进度与上一次完整复核结果均保持不变。
+
+施工复核结束后，将当前检查点冻结成不可变记录：
+
+```bash
+curl -X POST \
+  http://localhost:8000/plans/demo/execution-checkpoints/e1b6.../complete
+```
+
+完成后的 `review_id` 与 `checkpoint_id` 相同，记录可通过旧接口
+`GET /plans/{plan_id}/reviews/{review_id}` 读取；检查点状态变为
+`COMPLETED`，不能再追加或再次完成。旧的一次性
+`POST /plans/{plan_id}/reviews` 接口继续保持原语义，不创建执行检查点。
+
 ### 错误代码
 
 | HTTP | code | 含义 |
 | --- | --- | --- |
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON |
-| 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `REVIEW_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
+| 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `REVIEW_NOT_FOUND` / `CHECKPOINT_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
 | 409 | `REVISION_CONFLICT` | 保存冲突，`details[].code` 区分：`PLAN_ALREADY_EXISTS`（并发首次创建同一方案，落败请求）/ `REVISION_MISMATCH`（携带的 `expected_revision` 已过期，方案在读取后被他人修改）；重新读取当前方案与修订号后再提交 |
 | 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
-| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、`INVALID_EXPECTED_REVISION`、`UNKNOWN_SEGMENT`、`INVALID_CLOSED_SEGMENTS_FIELD`、`INVALID_KEEP_OPEN_SEGMENTS_FIELD`、`CLOSED_KEEP_OPEN_OVERLAP` 等） |
+| 409 | `CHECKPOINT_REVISION_CONFLICT` / `CHECKPOINT_COMPLETED` | 携带的检查点修订号已过期（`CHECKPOINT_REVISION_MISMATCH`），或检查点已冻结完成而不能继续追加/重复完成 |
+| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、`INVALID_EXPECTED_REVISION`、`UNKNOWN_SEGMENT`、`INVALID_CLOSED_SEGMENTS_FIELD`、`INVALID_KEEP_OPEN_SEGMENTS_FIELD`、`CLOSED_KEEP_OPEN_OVERLAP`、`MISSING_EXPECTED_REVISION`、`NO_SEGMENTS_ADDED`、`SEGMENT_ALREADY_CLOSED`、`SEGMENT_ALREADY_KEEP_OPEN` 等） |
 | 422 | `REVIEW_NOT_EXECUTABLE` | 复核的保持开启约束保留了污染源到保护区的路径，关闭其余边也无法隔断（`details[].code = REQUIRED_OPEN_PATH`），不写复核记录 |
 | 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` | 服务内部错误 |
 
@@ -284,6 +355,8 @@ pytest
   方案/计算/采用快照、复核记录按 ID 读取（含 8 线程并发读取一致），以及
   未知/重复管段、两类约束重叠、无采用结果、数据库写入失败都不留下半条
   记录。
+- `tests/test_checkpoint.py`：逐班执行检查点——小图全部“剩余/已关闭/保持开启”状态枚举对拍、逐次追加与修订号推进、重复/交叉/不可执行/未知管段回滚、方案修订与采用切换后的创建时冻结快照、完成为不可变复核记录，以及旧一次性复核接口兼容。
+- `tests/test_checkpoint_pg.py`：**仅在真实 PostgreSQL 下运行**（SQLite 自动跳过），用行锁确定交错提交：同修订追加一胜一过期、创建检查点与采用切换交错、新连接/重启后的检查点与复核读取；另覆盖交班者重读新修订后仍提交重复约束及不可执行约束时的回滚。
 - `tests/test_concurrency_pg.py`：**仅在真实 PostgreSQL 下运行**
   （SQLite 自动跳过），在数据库层确定性地卡住两次操作：
   - 并发首次创建同一方案：一胜（200 修订 1）一负（409
@@ -307,7 +380,7 @@ app/
   flow.py        自实现 64 位整数容量 Dinic 最大流 / 最小割（含剩余网络复核）
   validation.py  方案负载与复核负载的域校验（稳定错误码）
   services.py    保存、计算、采用、复核、查询业务逻辑
-  models.py      plans / computations / adoptions / adoption_events / reviews 表
+  models.py      plans / computations / adoptions / adoption_events / execution_checkpoints / reviews 表
   db.py          引擎、会话、建表（带重试）
   errors.py      统一错误信封
 tests/           穷举对拍 + 单元 + 接口 + 快照 + 复核 + PostgreSQL 并发验收

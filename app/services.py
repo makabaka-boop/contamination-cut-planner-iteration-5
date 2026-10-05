@@ -32,9 +32,17 @@
   落库共享同一冻结版本；已关闭边视为移除，保持开启边视为不可切断。
   校验失败或约束使方案不可执行都在写入前拒绝，单行写入失败整体回滚，
   绝不留下半条复核记录，也不修改方案、计算记录与采用快照。
+- 检查点从当前生效采用创建，创建事务在 plans 行锁后重读当前采用指针，并
+  永久保存其不可变 adoption event、计算版本与完整快照；之后方案编辑或采用
+  切换都不影响检查点。每次追加由检查点行锁串行化，先检查状态与调用方携带
+  的预期修订号，再按累计的已关闭/保持开启集合在冻结方案上重算；只能增加
+  管段，重复、交叉、未知 ID、不可执行或写库失败均整笔回滚，进度和上一次
+  完整结果不变。完成时检查点状态与同 ID 的不可变 reviews 记录在同一事务中
+  写入；旧一次性复核接口仍独立保持不变。
 """
 
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 
 from sqlalchemy import update
@@ -402,7 +410,7 @@ def review(db, plan_id, closed_ids, keep_open_ids=None):
         "plan_id": plan_id,
         "plan_revision": snapshot["plan_revision"],
         "computation_id": snapshot["computation_id"],
-        "created_at": created_at.isoformat(),
+        "created_at": _utc_iso(created_at),
         "closed_segments": outcome["closed_segments"],
     }
     if keep_open_ids is not None:
@@ -441,3 +449,345 @@ def get_review_or_404(db, plan_id, review_id):
             f"review {review_id!r} does not exist for plan {plan_id!r}",
         )
     return review
+
+
+# ---------------------------------------------------------------------------
+# 逐班执行检查点
+# ---------------------------------------------------------------------------
+
+
+def _infeasible_error_and_rollback(db):
+    db.rollback()
+    return ApiError(
+        422,
+        "REVIEW_NOT_EXECUTABLE",
+        "a required-open path still connects a pollution source to a protected zone",
+        [
+            {
+                "code": "REQUIRED_OPEN_PATH",
+                "field": "keep_open_segments",
+                "message": (
+                    "required-open segments still connect a pollution source "
+                    "to a protected zone"
+                ),
+            }
+        ],
+    )
+
+
+def _utc_iso(value):
+    """SQLite 会去掉 DateTime 的时区；对外统一规范化为 UTC ISO-8601。"""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
+def _checkpoint_view(row):
+    """构造检查点当前执行进度；完成时附带不可变复核记录定位信息。"""
+    view = {
+        "checkpoint_id": row.checkpoint_id,
+        "plan_id": row.plan_id,
+        "plan_revision": row.plan_revision,
+        "computation_id": row.computation_id,
+        "revision": row.revision,
+        "status": row.status,
+        "created_at": _utc_iso(row.created_at),
+        "updated_at": _utc_iso(row.updated_at),
+        **row.outcome,
+    }
+    if row.status == "COMPLETED":
+        view["completed_at"] = _utc_iso(row.completed_at)
+        view["review_id"] = row.checkpoint_id
+    return view
+
+
+def _review_record_from_checkpoint(row, created_at):
+    """从完成时的检查点构造与旧一次性复核同构的不可变记录。"""
+    outcome = row.outcome
+    record = {
+        "review_id": row.checkpoint_id,
+        "plan_id": row.plan_id,
+        "plan_revision": row.plan_revision,
+        "computation_id": row.computation_id,
+        "created_at": _utc_iso(created_at),
+        "closed_segments": list(row.closed_segments),
+        "keep_open_segments": list(row.keep_open_segments),
+        "additional_segments": list(outcome["additional_segments"]),
+        "additional_cost": outcome["additional_cost"],
+        "witness": deepcopy(outcome["witness"]),
+    }
+    return record
+
+
+def create_checkpoint(db, plan_id):
+    """从一次当前已采用结果创建逐班执行检查点。
+
+    检查点永久绑定 adoption_events 中当时生效采用事件的 ID、计算版本和
+    冻结快照。后来替换 plans/adoptions 不影响该事件；检查点之后的每次
+    追加都只使用这里保存的 snapshot。整个读取、求解与插入在一个事务中，
+    写入失败则回滚，采用结果和旧复核记录均不变。
+    """
+    get_plan_or_404(db, plan_id)
+    get_adoption(db, plan_id)
+    # 与 adopt() 先争同一把 plans 行锁，使“创建检查点”和“切换采用”
+    # 在 PostgreSQL 上确定串行化：持锁后重读当前采用指针，再绑定它指向的
+    # 不可变 adoption event。采用事务只插入新事件，不会反向等待旧事件，
+    # 因此该加锁顺序不会形成死锁。
+    db.query(models.Plan).filter(
+        models.Plan.plan_id == plan_id
+    ).with_for_update().populate_existing().one()
+    adoption = (
+        db.query(models.Adoption)
+        .filter(models.Adoption.plan_id == plan_id)
+        .populate_existing()
+        .one()
+    )
+    event = (
+        db.query(models.AdoptionEvent)
+        .filter(
+            models.AdoptionEvent.plan_id == plan_id,
+            models.AdoptionEvent.computation_id == adoption.computation_id,
+        )
+        .with_for_update()
+        .one()
+    )
+    snapshot = deepcopy(event.snapshot)
+    frozen_plan = snapshot["plan"]
+
+    try:
+        outcome = solve_residual_min_cut(frozen_plan, [], [])
+    except ResidualCutInfeasible:
+        # 合法方案且无保持开启约束时不可能发生；仍按统一事务失败语义处理。
+        raise _infeasible_error_and_rollback(db)
+
+    now = datetime.now(timezone.utc)
+    checkpoint_id = uuid.uuid4().hex
+    row = models.ExecutionCheckpoint(
+        checkpoint_id=checkpoint_id,
+        plan_id=plan_id,
+        adoption_event_id=event.id,
+        computation_id=event.computation_id,
+        plan_revision=event.plan_revision,
+        revision=1,
+        status="ACTIVE",
+        frozen_snapshot=snapshot,
+        closed_segments=[],
+        keep_open_segments=[],
+        outcome=outcome,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise ApiError(500, "INTERNAL_ERROR", "failed to persist the checkpoint")
+    return row
+
+
+def get_checkpoint_or_404(db, plan_id, checkpoint_id):
+    row = db.get(models.ExecutionCheckpoint, checkpoint_id)
+    if row is None or row.plan_id != plan_id:
+        raise ApiError(
+            404,
+            "CHECKPOINT_NOT_FOUND",
+            f"checkpoint {checkpoint_id!r} does not exist for plan {plan_id!r}",
+        )
+    return row
+
+
+def append_checkpoint(
+    db, plan_id, checkpoint_id, expected_revision, added_closed, added_keep_open
+):
+    """在同一执行检查点上追加现场管段，并重算累计最低追加隔断。
+
+    事务先对检查点行加锁并检查 status/expected_revision；过期修订返回
+    409 且不修改进度。随后所有集合运算、未知管段校验和求解都使用创建时
+    冻结的 snapshot。追加只能让两个累计集合变大：不得重复加入、不得在两
+    类集合之间交叉移动。约束不可执行或写库失败时，整笔事务回滚。
+    """
+    get_plan_or_404(db, plan_id)
+    row = (
+        db.query(models.ExecutionCheckpoint)
+        .filter(
+            models.ExecutionCheckpoint.plan_id == plan_id,
+            models.ExecutionCheckpoint.checkpoint_id == checkpoint_id,
+        )
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if row is None or row.plan_id != plan_id:
+        db.rollback()
+        raise ApiError(
+            404,
+            "CHECKPOINT_NOT_FOUND",
+            f"checkpoint {checkpoint_id!r} does not exist for plan {plan_id!r}",
+        )
+    if row.status == "COMPLETED":
+        db.rollback()
+        raise ApiError(
+            409,
+            "CHECKPOINT_COMPLETED",
+            f"checkpoint {checkpoint_id!r} has already been completed",
+        )
+    if row.revision != expected_revision:
+        db.rollback()
+        raise ApiError(
+            409,
+            "CHECKPOINT_REVISION_CONFLICT",
+            (
+                f"checkpoint {checkpoint_id!r} was modified after revision "
+                f"{expected_revision} was read; re-read the current checkpoint "
+                "and retry"
+            ),
+            [
+                {
+                    "code": "CHECKPOINT_REVISION_MISMATCH",
+                    "field": "expected_revision",
+                    "message": (
+                        f"expected revision {expected_revision} no longer "
+                        "matches the current checkpoint revision"
+                    ),
+                }
+            ],
+        )
+
+    snapshot = row.frozen_snapshot
+    frozen_plan = snapshot["plan"]
+    current_closed = set(row.closed_segments)
+    current_keep_open = set(row.keep_open_segments)
+    new_closed = set(added_closed)
+    new_keep_open = set(added_keep_open)
+
+    details = []
+    reused_closed_ids = new_closed & current_closed
+    reused_keep_open_ids = new_keep_open & current_keep_open
+    cross_existing = sorted(
+        (new_closed & current_keep_open) | (new_keep_open & current_closed)
+    )
+    details.extend(
+        {
+            "code": "SEGMENT_ALREADY_CLOSED",
+            "field": f"closed_segments[{i}]",
+            "message": f"segment {seg_id!r} was already recorded as closed",
+        }
+        for i, seg_id in enumerate(added_closed)
+        if seg_id in reused_closed_ids
+    )
+    details.extend(
+        {
+            "code": "SEGMENT_ALREADY_KEEP_OPEN",
+            "field": f"keep_open_segments[{i}]",
+            "message": f"segment {seg_id!r} was already recorded as keep-open",
+        }
+        for i, seg_id in enumerate(added_keep_open)
+        if seg_id in reused_keep_open_ids
+    )
+    for seg_id in cross_existing:
+        details.append(
+            {
+                "code": "CLOSED_KEEP_OPEN_OVERLAP",
+                "field": "closed_segments",
+                "message": (
+                    f"segment {seg_id!r} cannot move between closed and "
+                    "required-open constraints"
+                ),
+            }
+        )
+    if details:
+        db.rollback()
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "checkpoint constraints can only add disjoint segments",
+            details,
+        )
+
+    combined_closed = current_closed | new_closed
+    combined_keep_open = current_keep_open | new_keep_open
+    try:
+        # 已累计 ID 在之前成功追加时已经验证过；这里只需校验本次新增 ID，
+        # 错误字段下标也能准确指向本次请求。
+        validate_review_segments_known(
+            added_closed, added_keep_open, frozen_plan
+        )
+    except ApiError:
+        db.rollback()
+        raise
+
+    try:
+        outcome = solve_residual_min_cut(
+            frozen_plan, combined_closed, combined_keep_open
+        )
+    except ResidualCutInfeasible:
+        raise _infeasible_error_and_rollback(db)
+
+    now = datetime.now(timezone.utc)
+    row.closed_segments = outcome["closed_segments"]
+    row.keep_open_segments = outcome["keep_open_segments"]
+    row.outcome = outcome
+    row.revision += 1
+    row.updated_at = now
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise ApiError(500, "INTERNAL_ERROR", "failed to persist the checkpoint")
+    return row
+
+
+def complete_checkpoint(db, plan_id, checkpoint_id):
+    """把当前检查点转换为按 ID 可读取的不可变复核记录。
+
+    转换与检查点状态更新必须在同一事务中：reviews.review_id 复用
+    checkpoint_id，使旧 GET /reviews/{id} 成为统一读取入口。完成时冻结
+    当前累计约束及其重算结果（可能仍包含建议追加管段），之后不能继续
+    追加；只允许活动检查点完成一次。
+    """
+    get_plan_or_404(db, plan_id)
+    row = (
+        db.query(models.ExecutionCheckpoint)
+        .filter(
+            models.ExecutionCheckpoint.plan_id == plan_id,
+            models.ExecutionCheckpoint.checkpoint_id == checkpoint_id,
+        )
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if row is None or row.plan_id != plan_id:
+        db.rollback()
+        raise ApiError(
+            404,
+            "CHECKPOINT_NOT_FOUND",
+            f"checkpoint {checkpoint_id!r} does not exist for plan {plan_id!r}",
+        )
+    if row.status == "COMPLETED":
+        db.rollback()
+        raise ApiError(
+            409,
+            "CHECKPOINT_COMPLETED",
+            f"checkpoint {checkpoint_id!r} has already been completed",
+        )
+    completed_at = datetime.now(timezone.utc)
+    record = _review_record_from_checkpoint(row, completed_at)
+    review_row = models.Review(
+        review_id=row.checkpoint_id,
+        plan_id=row.plan_id,
+        computation_id=row.computation_id,
+        plan_revision=row.plan_revision,
+        record=record,
+        created_at=completed_at,
+    )
+    db.add(review_row)
+    row.status = "COMPLETED"
+    row.completed_at = completed_at
+    row.updated_at = completed_at
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise ApiError(500, "INTERNAL_ERROR", "failed to complete the checkpoint")
+    return row

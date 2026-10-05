@@ -12,7 +12,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import services
 from .db import get_db, init_db
 from .errors import ApiError, error_body
-from .validation import validate_plan_payload, validate_review_payload
+from .validation import (
+    validate_checkpoint_append_payload,
+    validate_plan_payload,
+    validate_review_payload,
+)
 
 PLAN_ID_REGEX = r"^[A-Za-z0-9_-]{1,64}$"
 
@@ -220,6 +224,72 @@ def get_adoption(
 ):
     """查询当前已采用结果（完整快照）。"""
     return services.get_adoption(db, plan_id).snapshot
+
+
+# ---------- 逐班执行检查点 ----------
+
+
+@app.post("/plans/{plan_id}/execution-checkpoints")
+async def create_execution_checkpoint(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    db: Session = Depends(get_db),
+):
+    """从当前已采用结果创建一个永久冻结方案与计算版本的执行检查点。"""
+    checkpoint = await to_thread.run_sync(services.create_checkpoint, db, plan_id)
+    return services._checkpoint_view(checkpoint)
+
+
+@app.get("/plans/{plan_id}/execution-checkpoints/{checkpoint_id}")
+def get_execution_checkpoint(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    checkpoint_id: str = "",
+    db: Session = Depends(get_db),
+):
+    """读取检查点当前累计执行进度。"""
+    services.get_plan_or_404(db, plan_id)
+    return services._checkpoint_view(
+        services.get_checkpoint_or_404(db, plan_id, checkpoint_id)
+    )
+
+
+@app.post("/plans/{plan_id}/execution-checkpoints/{checkpoint_id}/append")
+async def append_execution_checkpoint(
+    request: Request,
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    checkpoint_id: str = "",
+    db: Session = Depends(get_db),
+):
+    """在同一执行进度上只追加新的已关闭或必须保持开启管段。"""
+    body = await _json_body(request)
+    expected_revision, closed_ids, keep_open_ids = (
+        validate_checkpoint_append_payload(body)
+    )
+    checkpoint = await to_thread.run_sync(
+        services.append_checkpoint,
+        db,
+        plan_id,
+        checkpoint_id,
+        expected_revision,
+        closed_ids,
+        keep_open_ids,
+    )
+    return services._checkpoint_view(checkpoint)
+
+
+@app.post("/plans/{plan_id}/execution-checkpoints/{checkpoint_id}/complete")
+async def complete_execution_checkpoint(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    checkpoint_id: str = "",
+    db: Session = Depends(get_db),
+):
+    """完成检查点，并生成可通过旧 reviews/{id} 接口读取的不可变记录。"""
+    checkpoint = await to_thread.run_sync(
+        services.complete_checkpoint, db, plan_id, checkpoint_id
+    )
+    return services._checkpoint_view(checkpoint)
+
+
+# ---------- 旧的一次性现场关闭复核（保持兼容） ----------
 
 
 @app.post("/plans/{plan_id}/reviews")

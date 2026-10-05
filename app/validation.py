@@ -327,6 +327,107 @@ def validate_review_payload(data):
     return closed, keep_open if keep_open_provided else None
 
 
+def validate_checkpoint_append_payload(data):
+    """校验执行检查点的追加负载。
+
+    追加必须携带正整数 ``expected_revision``，并至少追加一个管段。
+    ``closed_segments`` 与 ``keep_open_segments`` 均可缺省；缺省时不向
+    对应集合追加任何管段。本函数只检查本次请求自身：列表类型、ID 格式、
+    列表内重复、本次两类集合互斥。与已累计集合的重复/交叉、ID 是否存在
+    于冻结方案中，必须在持检查点行锁、确认预期修订号后由服务层用创建时
+    冻结的同一版本校验。
+    """
+    if not isinstance(data, dict):
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "request body must be a JSON object",
+            [_detail("INVALID_BODY", "$", "expected a JSON object")],
+        )
+
+    if "expected_revision" not in data:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "expected_revision is required",
+            [
+                _detail(
+                    "MISSING_EXPECTED_REVISION",
+                    "expected_revision",
+                    "expected_revision must be an integer >= 1",
+                )
+            ],
+        )
+    expected_revision = data["expected_revision"]
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 1
+    ):
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "expected_revision must be a positive integer",
+            [
+                _detail(
+                    "INVALID_EXPECTED_REVISION",
+                    "expected_revision",
+                    "expected_revision must be an integer >= 1",
+                )
+            ],
+        )
+
+    details = []
+    closed = []
+    keep_open = []
+
+    def append_list(field, target):
+        if field not in data or data[field] is None:
+            if field in data:
+                details.append(
+                    _detail(
+                        f"INVALID_{field.upper()}_FIELD",
+                        field,
+                        "must be a list of segment ids",
+                    )
+                )
+            return
+        seen = set()
+        target.extend(
+            _validate_segment_id_list(data[field], field, details, seen)
+        )
+
+    append_list("closed_segments", closed)
+    append_list("keep_open_segments", keep_open)
+
+    for seg_id in sorted(set(closed) & set(keep_open)):
+        details.append(
+            _detail(
+                "CLOSED_KEEP_OPEN_OVERLAP",
+                "closed_segments",
+                f"segment {seg_id!r} cannot be both closed and required open",
+            )
+        )
+
+    if not closed and not keep_open and not details:
+        details.append(
+            _detail(
+                "NO_SEGMENTS_ADDED",
+                "closed_segments",
+                "at least one closed or keep-open segment must be appended",
+            )
+        )
+
+    if details:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "checkpoint append payload is invalid",
+            details,
+        )
+    return expected_revision, closed, keep_open
+
+
 def validate_segments_known(closed_ids, frozen_plan):
     """已关闭管段必须逐一存在于复核所采用的冻结方案中。"""
     validate_review_segments_known(closed_ids, None, frozen_plan)

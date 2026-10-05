@@ -92,6 +92,42 @@ class AdoptionEvent(Base):
     adopted_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class ExecutionCheckpoint(Base):
+    """逐班执行的累计现场检查点。
+
+    检查点在创建时永久绑定当时生效的 adoption event：直接保存该采用事件
+    的计算 ID、方案修订号与完整冻结快照。随后方案编辑或生效采用切换都不
+    会影响检查点，所有追加都只按这份快照重算。
+
+    revision 从 1 开始；每次成功追加递增。状态为 COMPLETED 时，同一行与
+    reviews 中按同一 checkpoint_id 可读取的不可变复核记录一起冻结。
+    """
+
+    __tablename__ = "execution_checkpoints"
+
+    checkpoint_id = Column(String(32), primary_key=True)
+    plan_id = Column(
+        String(64), ForeignKey("plans.plan_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    adoption_event_id = Column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        ForeignKey("adoption_events.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    computation_id = Column(String(32), nullable=False, index=True)
+    plan_revision = Column(Integer, nullable=False)
+    revision = Column(Integer, nullable=False)
+    status = Column(String(16), nullable=False)  # ACTIVE / COMPLETED
+    frozen_snapshot = Column(JSON, nullable=False)
+    closed_segments = Column(JSON, nullable=False)
+    keep_open_segments = Column(JSON, nullable=False)
+    outcome = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class Review(Base):
     """现场关闭复核记录：对一次已采用结果的执行复核，只增不改。
 
@@ -100,6 +136,9 @@ class Review(Base):
     与修订号；全部取自采用快照冻结的同一版本。写入不触碰 plans /
     computations / adoptions / adoption_events，方案随后修订或采用被
     替换都不影响已落库的复核记录，可按 review_id 在重启后读取。
+
+    执行检查点完成时复用本表作为不可变复核记录，并将 review_id 取为
+    checkpoint_id；旧的一次性复核接口仍直接写入本表，两者读取接口相同。
     """
 
     __tablename__ = "reviews"

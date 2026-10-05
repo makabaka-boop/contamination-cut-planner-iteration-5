@@ -510,7 +510,7 @@ def test_review_keep_open_zero_cost_edge_picks_positive_alternative(client):
     assert record["additional_segments"] == ["w"]
     assert record["additional_cost"] == 5
     assert record["witness"] == {
-        "source_zones": ["S", "A"],
+        "source_zones": ["A", "S"],
         "cut_segments": ["w"],
         "total_cost": 5,
     }

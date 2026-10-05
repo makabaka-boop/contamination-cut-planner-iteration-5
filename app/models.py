@@ -1,4 +1,4 @@
-"""持久化模型：方案、计算记录、采用快照与不可变采用历史。"""
+"""持久化模型：方案、计算记录、采用快照、不可变采用历史与执行检查点。"""
 
 from sqlalchemy import (
     JSON,
@@ -92,6 +92,39 @@ class AdoptionEvent(Base):
     adopted_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class Checkpoint(Base):
+    """执行检查点：从一次已采用结果创建的逐次登记进度。
+
+    创建时永久绑定该采用事件冻结的方案与计算版本（snapshot），之后方案
+    修订或采用被其他计算替换都不影响本检查点——追加只在创建时的冻结
+    快照上推进。累计约束（已关闭 / 必须保持开启管段集合）只增不减：
+    每次被接受的追加在同一事务中按累计约束重算最低追加隔断、费用及
+    见证，并与新修订号一同保存；约束不可执行、修订号过期或写入失败时，
+    进度与最近一次完整复核结果都不变。完成后状态转为 COMPLETED 并
+    生成不可变复核记录（reviews 表），review_id 指向该记录。
+    """
+
+    __tablename__ = "checkpoints"
+
+    checkpoint_id = Column(String(32), primary_key=True)
+    plan_id = Column(
+        String(64), ForeignKey("plans.plan_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    revision = Column(Integer, nullable=False)  # 创建为 1，每次接受的追加 +1
+    status = Column(String(16), nullable=False)  # OPEN / COMPLETED
+    # 创建时冻结的采用事件：计算 ID、方案修订号与完整快照，永久绑定
+    computation_id = Column(String(32), nullable=False, index=True)
+    plan_revision = Column(Integer, nullable=False)
+    snapshot = Column(JSON, nullable=False)
+    closed_segments = Column(JSON, nullable=False)  # 累计已关闭管段（升序）
+    keep_open_segments = Column(JSON, nullable=False)  # 累计保持开启管段（升序）
+    outcome = Column(JSON, nullable=False)  # 最近一次完整复核结果
+    review_id = Column(String(32), nullable=True)  # 完成时生成的复核记录
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class Review(Base):
     """现场关闭复核记录：对一次已采用结果的执行复核，只增不改。
 
@@ -100,6 +133,8 @@ class Review(Base):
     与修订号；全部取自采用快照冻结的同一版本。写入不触碰 plans /
     computations / adoptions / adoption_events，方案随后修订或采用被
     替换都不影响已落库的复核记录，可按 review_id 在重启后读取。
+    记录有两个来源：一次性复核接口（POST .../reviews），以及执行检查点
+    完成时把当前进度整体冻结转存（record 中带 checkpoint_id）。
     """
 
     __tablename__ = "reviews"

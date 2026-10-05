@@ -1,6 +1,7 @@
 """洁净厂房通风管段最小费用隔断服务 —— HTTP 接口层。"""
 
 from contextlib import asynccontextmanager
+from datetime import timezone
 
 from anyio import to_thread
 from fastapi import Depends, FastAPI, Path, Request
@@ -12,7 +13,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import services
 from .db import get_db, init_db
 from .errors import ApiError, error_body
-from .validation import validate_plan_payload, validate_review_payload
+from .validation import (
+    validate_checkpoint_append_payload,
+    validate_plan_payload,
+    validate_review_payload,
+)
 
 PLAN_ID_REGEX = r"^[A-Za-z0-9_-]{1,64}$"
 
@@ -128,6 +133,34 @@ def _computation_view(computation):
         "status": computation.status,
         "result": computation.result,
         "error": computation.error,
+    }
+
+
+def _iso(dt):
+    """统一时间戳为 UTC ISO 字符串（SQLite 读出的是 naive，按 UTC 解释）。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _checkpoint_view(checkpoint):
+    """检查点进度视图：累计约束、最近一次完整复核结果与冻结版本。"""
+    outcome = checkpoint.outcome
+    return {
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "plan_id": checkpoint.plan_id,
+        "revision": checkpoint.revision,
+        "status": checkpoint.status,
+        "plan_revision": checkpoint.plan_revision,
+        "computation_id": checkpoint.computation_id,
+        "created_at": _iso(checkpoint.created_at),
+        "updated_at": _iso(checkpoint.updated_at),
+        "closed_segments": checkpoint.closed_segments,
+        "keep_open_segments": checkpoint.keep_open_segments,
+        "additional_segments": outcome["additional_segments"],
+        "additional_cost": outcome["additional_cost"],
+        "witness": outcome["witness"],
+        "review_id": checkpoint.review_id,
     }
 
 
@@ -254,3 +287,82 @@ def get_review(
     """按 ID 查询复核记录（冻结的输入与结果，重启后仍可读取）。"""
     services.get_plan_or_404(db, plan_id)
     return services.get_review_or_404(db, plan_id, review_id).record
+
+
+# ---------- 执行检查点：分班逐次登记，完成时转不可变复核记录 ----------
+
+@app.post("/plans/{plan_id}/checkpoints")
+def create_checkpoint(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX), db: Session = Depends(get_db)
+):
+    """从当前已采用结果创建执行检查点。
+
+    检查点永久绑定该采用事件冻结的方案与计算版本；之后编辑方案或采用
+    另一计算，本检查点仍只按创建时的冻结快照推进。初始累计约束为空，
+    初始复核结果即冻结方案的最小费用隔断。
+    """
+    return _checkpoint_view(services.create_checkpoint(db, plan_id))
+
+
+@app.get("/plans/{plan_id}/checkpoints/{checkpoint_id}")
+def get_checkpoint(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    checkpoint_id: str = "",
+    db: Session = Depends(get_db),
+):
+    """查询检查点当前进度（交班者在同一执行进度上继续复核）。"""
+    services.get_plan_or_404(db, plan_id)
+    return _checkpoint_view(
+        services.get_checkpoint_or_404(db, plan_id, checkpoint_id)
+    )
+
+
+@app.post("/plans/{plan_id}/checkpoints/{checkpoint_id}/appends")
+async def append_checkpoint(
+    request: Request,
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    checkpoint_id: str = "",
+    db: Session = Depends(get_db),
+):
+    """按预期检查点修订追加登记现场管段。
+
+    只能增加管段：新登记的已关闭/保持开启管段不得与累计集合重复或交叉。
+    服务在同一事务中按累计约束重算最低追加隔断、费用及见证，并与新修订
+    一同保存；约束不可执行（422）、修订过期（409）或写入失败（500）时，
+    进度与上一次完整复核结果都不变。
+    """
+    body = await _json_body(request)
+    expected_revision, closed_ids, keep_open_ids = (
+        validate_checkpoint_append_payload(body)
+    )
+    # 条件 UPDATE 可能等待行锁，放到工作线程执行，使并发追加能在
+    # 数据库层真正并行地争锁，由条件 UPDATE 给出确定结果。
+    checkpoint = await to_thread.run_sync(
+        services.append_checkpoint,
+        db,
+        plan_id,
+        checkpoint_id,
+        expected_revision,
+        closed_ids,
+        keep_open_ids,
+    )
+    return _checkpoint_view(checkpoint)
+
+
+@app.post("/plans/{plan_id}/checkpoints/{checkpoint_id}/complete")
+async def complete_checkpoint(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    checkpoint_id: str = "",
+    db: Session = Depends(get_db),
+):
+    """完成检查点：把当前进度转成可按 ID 读取的不可变复核记录。
+
+    复核记录冻结累计约束与最近一次完整复核结果（取自条件更新后持锁
+    重读的最终状态），与状态翻转在同一事务中提交；之后该检查点不再
+    接受追加。返回的复核记录可用 GET /plans/{plan_id}/reviews/{review_id}
+    读取。
+    """
+    review = await to_thread.run_sync(
+        services.complete_checkpoint, db, plan_id, checkpoint_id
+    )
+    return review.record

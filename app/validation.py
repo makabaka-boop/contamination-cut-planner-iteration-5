@@ -327,6 +327,119 @@ def validate_review_payload(data):
     return closed, keep_open if keep_open_provided else None
 
 
+def validate_checkpoint_append_payload(data):
+    """校验检查点追加请求负载，返回（预期修订号, 新关闭 ID, 新保持开启 ID）。
+
+    ``expected_revision`` 必填且必须是正整数（检查点的乐观并发令牌）；
+    ``closed_segments`` / ``keep_open_segments`` 均可缺省（视为空列表），
+    各自不得重复，两类之间也不得交叉。追加的管段是否存在于检查点冻结
+    方案、是否与累计登记冲突，由服务层拿到检查点后判定
+    （validate_review_segments_known / validate_checkpoint_append_fresh），
+    校验、算法与持久层始终使用创建时冻结的同一版本。
+    """
+    if not isinstance(data, dict):
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "request body must be a JSON object",
+            [_detail("INVALID_BODY", "$", "expected a JSON object")],
+        )
+
+    details = []
+    expected_revision = data.get("expected_revision")
+    # bool 是 int 的子类，必须显式排除
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 1
+    ):
+        details.append(
+            _detail(
+                "INVALID_EXPECTED_REVISION",
+                "expected_revision",
+                "expected_revision is required and must be an integer >= 1",
+            )
+        )
+
+    closed = _validate_segment_id_list(
+        data.get("closed_segments", []), "closed_segments", details, set()
+    )
+    keep_open = _validate_segment_id_list(
+        data.get("keep_open_segments", []), "keep_open_segments", details, set()
+    )
+    for seg_id in sorted(set(closed) & set(keep_open)):
+        details.append(
+            _detail(
+                "CLOSED_KEEP_OPEN_OVERLAP",
+                "closed_segments",
+                f"segment {seg_id!r} cannot be both closed and required open",
+            )
+        )
+
+    if details:
+        raise ApiError(
+            422, "VALIDATION_ERROR", "checkpoint append payload is invalid", details
+        )
+    return expected_revision, closed, keep_open
+
+
+def validate_checkpoint_append_fresh(
+    closed_ids, keep_open_ids, registered_closed, registered_keep_open
+):
+    """追加的管段不得与检查点已登记的累计集合重复或交叉。
+
+    累计约束只增不减：新登记的已关闭管段不得已在累计已关闭集合中
+    （重复），也不得已在累计保持开启集合中（交叉）；保持开启同理。
+    """
+    details = []
+    for seg_id in closed_ids:
+        if seg_id in registered_closed:
+            details.append(
+                _detail(
+                    "DUPLICATE_SEGMENT_ID",
+                    "closed_segments",
+                    f"segment {seg_id!r} is already registered as closed "
+                    "in this checkpoint",
+                )
+            )
+        elif seg_id in registered_keep_open:
+            details.append(
+                _detail(
+                    "CLOSED_KEEP_OPEN_OVERLAP",
+                    "closed_segments",
+                    f"segment {seg_id!r} is already registered as required open "
+                    "in this checkpoint",
+                )
+            )
+    for seg_id in keep_open_ids:
+        if seg_id in registered_keep_open:
+            details.append(
+                _detail(
+                    "DUPLICATE_SEGMENT_ID",
+                    "keep_open_segments",
+                    f"segment {seg_id!r} is already registered as required open "
+                    "in this checkpoint",
+                )
+            )
+        elif seg_id in registered_closed:
+            details.append(
+                _detail(
+                    "CLOSED_KEEP_OPEN_OVERLAP",
+                    "keep_open_segments",
+                    f"segment {seg_id!r} is already registered as closed "
+                    "in this checkpoint",
+                )
+            )
+    if details:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "appended segments conflict with the checkpoint's registered "
+            "constraints",
+            details,
+        )
+
+
 def validate_segments_known(closed_ids, frozen_plan):
     """已关闭管段必须逐一存在于复核所采用的冻结方案中。"""
     validate_review_segments_known(closed_ids, None, frozen_plan)

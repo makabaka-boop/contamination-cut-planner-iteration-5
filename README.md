@@ -64,6 +64,10 @@ docker compose up --build
 | `GET /plans/{plan_id}/adoption` | 查询当前已采用结果（完整快照） |
 | `POST /plans/{plan_id}/reviews` | 对当前已采用结果执行**现场关闭复核**：提交现场确实已关闭的管段 ID 集合，并可选提交必须保持开启的管段 ID 集合；在采用快照冻结方案中，把已关闭边移除、把保持开启边视为不可切断，再在其余边上求追加关闭费用最小的隔断；复核记录冻结输入与结果，不修改方案、计算记录或采用快照 |
 | `GET /plans/{plan_id}/reviews/{review_id}` | 按 ID 查询复核记录（冻结的输入与结果，重启后仍可读取） |
+| `POST /plans/{plan_id}/checkpoints` | 从当前已采用结果创建**执行检查点**，永久绑定该采用事件的冻结方案与计算版本；初始累计约束为空 |
+| `GET /plans/{plan_id}/checkpoints/{checkpoint_id}` | 查询检查点当前进度（累计约束、最近一次完整复核结果、修订号），交班者据此在同一执行进度上继续 |
+| `POST /plans/{plan_id}/checkpoints/{checkpoint_id}/appends` | 携带 `expected_revision` 追加登记管段（只能增加，累计关闭与保持开启集合不得重复或交叉）；同一事务中按累计约束重算最低追加隔断、费用及见证并与新修订一同保存 |
+| `POST /plans/{plan_id}/checkpoints/{checkpoint_id}/complete` | 完成检查点：把当前进度转成可按 `review_id` 读取的不可变复核记录，检查点转为 `COMPLETED` 且不再接受追加 |
 
 ### 调用示例
 
@@ -207,16 +211,76 @@ curl -X POST http://localhost:8000/plans/demo/reviews \
 整体回滚（500），不留下半条复核记录，也绝不修改原方案、计算记录或
 采用快照。
 
+### 分班施工的执行检查点（逐次登记与交班）
+
+隔断施工分班完成时，工程师不必每次重新提交一整份清单：先基于当前
+已采用结果创建**执行检查点**，此后每班只**追加**登记本班现场已关闭
+及必须保持开启的管段；交班者查询检查点拿到当前修订号与累计进度，
+在同一执行进度上继续复核。
+
+```bash
+# 基于当前已采用结果创建检查点（永久绑定该采用事件的冻结方案与计算版本）
+curl -X POST http://localhost:8000/plans/demo/checkpoints
+```
+
+```json
+{
+  "checkpoint_id": "3f6a...",
+  "plan_id": "demo",
+  "revision": 1,
+  "status": "OPEN",
+  "plan_revision": 1,
+  "computation_id": "6dc73aa1...",
+  "created_at": "2026-10-05T08:00:00+00:00",
+  "updated_at": "2026-10-05T08:00:00+00:00",
+  "closed_segments": [],
+  "keep_open_segments": [],
+  "additional_segments": ["p1", "p2"],
+  "additional_cost": 10,
+  "witness": {"source_zones": ["SRC1", "SRC2"], "cut_segments": ["p1", "p2"], "total_cost": 10},
+  "review_id": null
+}
+```
+
+逐次追加（每次携带读到的检查点修订号；只能增加管段）：
+
+```bash
+curl -X POST http://localhost:8000/plans/demo/checkpoints/3f6a.../appends \
+  -H 'content-type: application/json' \
+  -d '{"expected_revision": 1, "closed_segments": ["p1"], "keep_open_segments": ["p3"]}'
+```
+
+- 检查点在创建时**永久绑定**该采用事件冻结的方案与计算版本：之后编辑
+  方案或采用另一计算，已有检查点仍只按创建时的冻结快照推进（后来修订
+  的同名管段费用不会混入，后来新增的管段 ID 一律以 422
+  `UNKNOWN_SEGMENT` 拒绝）；新创建的检查点则绑定新的采用；
+- 追加**只能增加**管段：新登记的管段不得与累计已关闭/保持开启集合
+  重复或交叉（422 `DUPLICATE_SEGMENT_ID` / `CLOSED_KEEP_OPEN_OVERLAP`），
+  同一请求内两类约束也不得交叉；
+- 服务在**同一事务**中按累计约束重算最低追加隔断、费用及见证，并与
+  新修订一同保存——"比对修订号 + 推进进度"由单条条件 UPDATE 原子
+  完成：修订号已被并发追加推进时返回 409 `REVISION_CONFLICT`
+  （`REVISION_MISMATCH`），重新读取后按新修订重试即可；
+- 累计保持开启约束使方案不可执行时返回 422 `REVIEW_NOT_EXECUTABLE`
+  （`REQUIRED_OPEN_PATH`）；约束冲突、修订过期或写入失败时，**进度与
+  上一次完整复核结果都不变**（无任何半提交状态）；
+- 施工完成时 `POST .../complete` 把当前进度整体冻结为不可变复核记录
+  （`record` 中带 `checkpoint_id`），可用
+  `GET /plans/{plan_id}/reviews/{review_id}` 读取；检查点转为
+  `COMPLETED` 后不再接受追加或重复完成（409
+  `CHECKPOINT_ALREADY_COMPLETED`）。旧的一次性复核接口行为不变。
+
 ### 错误代码
 
 | HTTP | code | 含义 |
 | --- | --- | --- |
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON |
-| 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `REVIEW_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
-| 409 | `REVISION_CONFLICT` | 保存冲突，`details[].code` 区分：`PLAN_ALREADY_EXISTS`（并发首次创建同一方案，落败请求）/ `REVISION_MISMATCH`（携带的 `expected_revision` 已过期，方案在读取后被他人修改）；重新读取当前方案与修订号后再提交 |
+| 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `REVIEW_NOT_FOUND` / `CHECKPOINT_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
+| 409 | `REVISION_CONFLICT` | 保存或检查点追加冲突，`details[].code` 区分：`PLAN_ALREADY_EXISTS`（并发首次创建同一方案，落败请求）/ `REVISION_MISMATCH`（携带的 `expected_revision` 已过期，方案或检查点在读取后被他人推进）；重新读取当前方案/检查点与修订号后再提交 |
 | 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
+| 409 | `CHECKPOINT_ALREADY_COMPLETED` | 检查点已完成，不再接受追加或重复完成 |
 | 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、`INVALID_EXPECTED_REVISION`、`UNKNOWN_SEGMENT`、`INVALID_CLOSED_SEGMENTS_FIELD`、`INVALID_KEEP_OPEN_SEGMENTS_FIELD`、`CLOSED_KEEP_OPEN_OVERLAP` 等） |
-| 422 | `REVIEW_NOT_EXECUTABLE` | 复核的保持开启约束保留了污染源到保护区的路径，关闭其余边也无法隔断（`details[].code = REQUIRED_OPEN_PATH`），不写复核记录 |
+| 422 | `REVIEW_NOT_EXECUTABLE` | 复核或检查点追加的保持开启约束保留了污染源到保护区的路径，关闭其余边也无法隔断（`details[].code = REQUIRED_OPEN_PATH`），不写复核记录、检查点进度不变 |
 | 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` | 服务内部错误 |
 
 非法整版、计算失败、采用不存在或已采用过的结果，以及并发保存的落败
@@ -284,6 +348,18 @@ pytest
   方案/计算/采用快照、复核记录按 ID 读取（含 8 线程并发读取一致），以及
   未知/重复管段、两类约束重叠、无采用结果、数据库写入失败都不留下半条
   记录。
+- `tests/test_checkpoint.py`：执行检查点——小图独立枚举对拍（随机累计
+  目标随机分批逐次追加，每步与一次性累计求解一致、最终与暴力枚举
+  对拍，不可执行的追加被拒绝且进度不变）、逐次关闭与交班全流程、
+  修订过期/重复/交叉/未知管段/不可执行/非法负载/写入失败时进度与
+  上一次完整复核结果都不变、方案修订与采用切换后仍按创建时冻结快照
+  推进、旧一次性复核接口不变、完成转不可变复核记录（含新会话重启
+  读取一致）。
+- `tests/test_checkpoint_pg.py`：**仅在真实 PostgreSQL 下运行**——
+  并发追加同一修订（恰一胜一负，落败者可按新修订重试）、追加与完成
+  并发（两种领先顺序下复核记录都冻结正确的最终进度）、并发完成
+  （只产生一条复核记录）、多会话交错提交覆盖逐次关闭、约束冲突、
+  采用切换与重启读取，以及多轮无协调并行追加对拍。
 - `tests/test_concurrency_pg.py`：**仅在真实 PostgreSQL 下运行**
   （SQLite 自动跳过），在数据库层确定性地卡住两次操作：
   - 并发首次创建同一方案：一胜（200 修订 1）一负（409
@@ -305,10 +381,10 @@ pytest
 app/
   main.py        FastAPI 路由与全局异常处理
   flow.py        自实现 64 位整数容量 Dinic 最大流 / 最小割（含剩余网络复核）
-  validation.py  方案负载与复核负载的域校验（稳定错误码）
-  services.py    保存、计算、采用、复核、查询业务逻辑
-  models.py      plans / computations / adoptions / adoption_events / reviews 表
+  validation.py  方案负载、复核负载与检查点追加负载的域校验（稳定错误码）
+  services.py    保存、计算、采用、复核、检查点、查询业务逻辑
+  models.py      plans / computations / adoptions / adoption_events / reviews / checkpoints 表
   db.py          引擎、会话、建表（带重试）
   errors.py      统一错误信封
-tests/           穷举对拍 + 单元 + 接口 + 快照 + 复核 + PostgreSQL 并发验收
+tests/           穷举对拍 + 单元 + 接口 + 快照 + 复核 + 检查点 + PostgreSQL 并发验收
 ```

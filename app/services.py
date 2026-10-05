@@ -32,8 +32,21 @@
   落库共享同一冻结版本；已关闭边视为移除，保持开启边视为不可切断。
   校验失败或约束使方案不可执行都在写入前拒绝，单行写入失败整体回滚，
   绝不留下半条复核记录，也不修改方案、计算记录与采用快照。
+- 执行检查点从当前已采用结果创建，永久绑定该采用事件冻结的方案与计算
+  版本；之后方案修订或采用被替换，已有检查点仍只按创建时的冻结快照
+  推进。追加携带预期检查点修订号，只能向累计约束中增加管段（关闭与
+  保持开启集合不得重复或交叉）；服务在同一事务中按累计约束重算最低
+  追加隔断、费用及见证，并由单条条件 UPDATE
+  （WHERE revision = expected_revision AND status = 'OPEN'）原子完成
+  "比对修订号 + 推进进度"：命中 0 行说明修订号已被并发追加推进
+  （409 REVISION_CONFLICT）或检查点已完成（409
+  CHECKPOINT_ALREADY_COMPLETED），落败写入回滚，进度与最近一次完整
+  复核结果都不变。完成在同一事务中把当前进度整体冻结为不可变复核记录
+  （reviews 表）并把检查点置为 COMPLETED；任何失败整体回滚，绝不留下
+  半条记录。
 """
 
+import copy
 import uuid
 from datetime import datetime, timezone
 
@@ -43,7 +56,10 @@ from sqlalchemy.exc import IntegrityError
 from . import models
 from .errors import ApiError
 from .flow import ResidualCutInfeasible, solve_min_cut, solve_residual_min_cut
-from .validation import validate_review_segments_known
+from .validation import (
+    validate_checkpoint_append_fresh,
+    validate_review_segments_known,
+)
 
 
 def get_plan_or_404(db, plan_id):
@@ -441,3 +457,267 @@ def get_review_or_404(db, plan_id, review_id):
             f"review {review_id!r} does not exist for plan {plan_id!r}",
         )
     return review
+
+
+# ---------- 执行检查点：分班逐次登记与交班复核 ----------
+
+
+def _checkpoint_outcome(outcome):
+    """从约束网络求解结果中提取需要随检查点一起冻结的复核结果。"""
+    return {
+        "additional_segments": outcome["additional_segments"],
+        "additional_cost": outcome["additional_cost"],
+        "witness": outcome["witness"],
+    }
+
+
+def _checkpoint_revision_conflict(checkpoint_id, expected_revision):
+    return ApiError(
+        409,
+        "REVISION_CONFLICT",
+        f"checkpoint {checkpoint_id!r} was modified after revision "
+        f"{expected_revision} was read; re-read the checkpoint and retry",
+        details=[
+            {
+                "code": "REVISION_MISMATCH",
+                "field": "expected_revision",
+                "message": (
+                    f"expected revision {expected_revision} no longer matches "
+                    "the current checkpoint revision"
+                ),
+            }
+        ],
+    )
+
+
+def _checkpoint_already_completed(checkpoint_id):
+    return ApiError(
+        409,
+        "CHECKPOINT_ALREADY_COMPLETED",
+        f"checkpoint {checkpoint_id!r} is already completed",
+    )
+
+
+def create_checkpoint(db, plan_id):
+    """从当前已采用结果创建执行检查点。
+
+    检查点永久绑定该采用事件冻结的方案与计算版本（快照整体复制，之后
+    方案修订或采用被替换都不影响本检查点）；初始累计约束为空，初始
+    复核结果即冻结方案的最小费用隔断。无采用结果时以 404 拒绝。
+    """
+    get_plan_or_404(db, plan_id)
+    adoption = get_adoption(db, plan_id)
+    # 深拷贝冻结快照，避免与采用行共享可变引用
+    snapshot = copy.deepcopy(adoption.snapshot)
+    # 空约束下的重算不会抛出 ResidualCutInfeasible（无保持开启边）
+    outcome = solve_residual_min_cut(snapshot["plan"], [], [])
+
+    now = datetime.now(timezone.utc)
+    checkpoint = models.Checkpoint(
+        checkpoint_id=uuid.uuid4().hex,
+        plan_id=plan_id,
+        revision=1,
+        status="OPEN",
+        computation_id=snapshot["computation_id"],
+        plan_revision=snapshot["plan_revision"],
+        snapshot=snapshot,
+        closed_segments=[],
+        keep_open_segments=[],
+        outcome=_checkpoint_outcome(outcome),
+        review_id=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(checkpoint)
+    try:
+        db.commit()
+    except Exception:
+        # 写入失败整体回滚：不留下半条检查点
+        db.rollback()
+        raise ApiError(500, "INTERNAL_ERROR", "failed to persist the checkpoint")
+    return checkpoint
+
+
+def get_checkpoint_or_404(db, plan_id, checkpoint_id):
+    checkpoint = db.get(models.Checkpoint, checkpoint_id)
+    if checkpoint is None or checkpoint.plan_id != plan_id:
+        raise ApiError(
+            404,
+            "CHECKPOINT_NOT_FOUND",
+            f"checkpoint {checkpoint_id!r} does not exist for plan {plan_id!r}",
+        )
+    return checkpoint
+
+
+def _reread_checkpoint_in_transaction(db, checkpoint_id):
+    """在本写入事务内重读检查点行（条件 UPDATE 已持有该行行锁）。"""
+    return (
+        db.query(models.Checkpoint)
+        .filter(models.Checkpoint.checkpoint_id == checkpoint_id)
+        .populate_existing()
+        .one()
+    )
+
+
+def append_checkpoint(db, plan_id, checkpoint_id, expected_revision,
+                      closed_ids, keep_open_ids):
+    """按预期修订号向检查点追加登记管段，并按累计约束重算复核结果。
+
+    - 追加只能增加管段：新管段不得与累计已关闭/保持开启集合重复或交叉，
+      且都必须存在于创建时冻结的方案中（后来修订新增的 ID 一律拒绝）；
+    - "比对修订号 + 推进进度"由单条条件 UPDATE 原子完成；命中 0 行时
+      区分检查点不存在（404）、已完成（409 CHECKPOINT_ALREADY_COMPLETED）
+      与修订号过期（409 REVISION_CONFLICT / REVISION_MISMATCH）；
+    - 累计约束使方案不可执行（保持开启路径仍连通污染源与保护区）时在
+      写入前以 422 REVIEW_NOT_EXECUTABLE 拒绝；任何失败都整体回滚，
+      进度与最近一次完整复核结果都不变。
+    """
+    get_plan_or_404(db, plan_id)
+    checkpoint = get_checkpoint_or_404(db, plan_id, checkpoint_id)
+    if checkpoint.status != "OPEN":
+        raise _checkpoint_already_completed(checkpoint_id)
+    if checkpoint.revision != expected_revision:
+        raise _checkpoint_revision_conflict(checkpoint_id, expected_revision)
+
+    frozen_plan = checkpoint.snapshot["plan"]
+    # 未知管段（含冻结版本之外、后来修订才出现的 ID）在写入前拒绝
+    validate_review_segments_known(closed_ids, keep_open_ids, frozen_plan)
+    validate_checkpoint_append_fresh(
+        closed_ids,
+        keep_open_ids,
+        set(checkpoint.closed_segments),
+        set(checkpoint.keep_open_segments),
+    )
+
+    new_closed = sorted(set(checkpoint.closed_segments) | set(closed_ids))
+    new_keep_open = sorted(set(checkpoint.keep_open_segments) | set(keep_open_ids))
+    try:
+        outcome = solve_residual_min_cut(frozen_plan, new_closed, new_keep_open)
+    except ResidualCutInfeasible as exc:
+        db.rollback()
+        raise ApiError(
+            422,
+            "REVIEW_NOT_EXECUTABLE",
+            str(exc),
+            [
+                {
+                    "code": "REQUIRED_OPEN_PATH",
+                    "field": "keep_open_segments",
+                    "message": (
+                        "required-open segments still connect a pollution source "
+                        "to a protected zone"
+                    ),
+                }
+            ],
+        )
+
+    now = datetime.now(timezone.utc)
+    result = db.execute(
+        update(models.Checkpoint)
+        .where(
+            models.Checkpoint.checkpoint_id == checkpoint_id,
+            models.Checkpoint.revision == expected_revision,
+            models.Checkpoint.status == "OPEN",
+        )
+        .values(
+            revision=expected_revision + 1,
+            closed_segments=new_closed,
+            keep_open_segments=new_keep_open,
+            outcome=_checkpoint_outcome(outcome),
+            updated_at=now,
+        )
+    )
+    if result.rowcount == 0:
+        # 条件 UPDATE 未命中：等待行锁期间检查点被并发推进或完成。
+        # 先回滚释放可能持有的锁，再在新事务中区分情况。
+        db.rollback()
+        row = db.get(models.Checkpoint, checkpoint_id)
+        if row is None or row.plan_id != plan_id:
+            raise ApiError(
+                404,
+                "CHECKPOINT_NOT_FOUND",
+                f"checkpoint {checkpoint_id!r} does not exist for plan "
+                f"{plan_id!r}",
+            )
+        if row.status != "OPEN":
+            raise _checkpoint_already_completed(checkpoint_id)
+        raise _checkpoint_revision_conflict(checkpoint_id, expected_revision)
+
+    checkpoint = _reread_checkpoint_in_transaction(db, checkpoint_id)
+    try:
+        db.commit()
+    except Exception:
+        # 写入失败整体回滚：进度与最近一次完整复核结果都不变
+        db.rollback()
+        raise ApiError(
+            500, "INTERNAL_ERROR", "failed to persist the checkpoint append"
+        )
+    return checkpoint
+
+
+def complete_checkpoint(db, plan_id, checkpoint_id):
+    """完成检查点：把当前进度整体冻结为可按 ID 读取的不可变复核记录。
+
+    复核记录取自条件更新后持锁重读的最终检查点状态（等待行锁期间被
+    并发追加推进的进度会一并冻结），与"OPEN -> COMPLETED"的状态翻转
+    在同一事务中提交；并发完成恰有一个成功，落败者得到 409
+    CHECKPOINT_ALREADY_COMPLETED；写入失败整体回滚，不留下半条复核
+    记录，检查点保持原状。
+    """
+    get_plan_or_404(db, plan_id)
+    checkpoint = get_checkpoint_or_404(db, plan_id, checkpoint_id)
+    if checkpoint.status != "OPEN":
+        raise _checkpoint_already_completed(checkpoint_id)
+
+    review_id = uuid.uuid4().hex
+    completed_at = datetime.now(timezone.utc)
+    result = db.execute(
+        update(models.Checkpoint)
+        .where(
+            models.Checkpoint.checkpoint_id == checkpoint_id,
+            models.Checkpoint.status == "OPEN",
+        )
+        .values(
+            status="COMPLETED",
+            review_id=review_id,
+            updated_at=completed_at,
+        )
+    )
+    if result.rowcount == 0:
+        # 并发完成已先行提交：本请求落败，不产生第二条复核记录
+        db.rollback()
+        raise _checkpoint_already_completed(checkpoint_id)
+
+    # 持锁重读最终进度：复核记录冻结的必须是检查点的最终状态
+    final = _reread_checkpoint_in_transaction(db, checkpoint_id)
+    record = {
+        "review_id": review_id,
+        "plan_id": plan_id,
+        "plan_revision": final.plan_revision,
+        "computation_id": final.computation_id,
+        "checkpoint_id": checkpoint_id,
+        "created_at": completed_at.isoformat(),
+        "closed_segments": final.closed_segments,
+        "keep_open_segments": final.keep_open_segments,
+        "additional_segments": final.outcome["additional_segments"],
+        "additional_cost": final.outcome["additional_cost"],
+        "witness": final.outcome["witness"],
+    }
+    row = models.Review(
+        review_id=review_id,
+        plan_id=plan_id,
+        computation_id=final.computation_id,
+        plan_revision=final.plan_revision,
+        record=record,
+        created_at=completed_at,
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except Exception:
+        # 写入失败整体回滚：复核记录与状态翻转一起消失，检查点保持 OPEN
+        db.rollback()
+        raise ApiError(
+            500, "INTERNAL_ERROR", "failed to persist the completion review"
+        )
+    return row
